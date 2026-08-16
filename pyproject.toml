@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "governance-tuple-reference"
+version = "1.0.0"
+description = "Reference implementation of the Governance Tuple primitives for auditable agentic AI decision-making"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "The Governance Tuple Authors"}
+]
+requires-python = ">=3.11"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[tool.setuptools]
+packages = ["reference_impl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

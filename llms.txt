@@ -1,0 +1,80 @@
+# Governance Tuple Reference Implementation
+
+> Anonymized, MIT-licensed, standalone reference implementation for the paper
+> "The Governance Tuple: An Atomic Record for Auditable Agentic AI Decision-Making"
+
+## Overview
+This repository provides a stdlib-only Python implementation of the Governance
+Tuple framework, enabling peer reviewers to verify the paper's implementation
+claims without accessing the private production codebase.
+
+## Quick Start
+```bash
+python verify_chain.py sample_governance_log.jsonl
+python -m pytest tests/ -v
+```
+
+## Modules
+
+### reference_impl/delegation_token.py
+Delegation Capability Token (DCT) with HMAC-SHA256 signing.
+- Classes: DelegationCapabilityToken, TokenBinding, ResourceSelector, Caveat, DelegationTokenManager
+- Key methods: create_token, verify_signature, is_expired, validate_binding, to_env_string, from_env_string
+- Error codes: IDP_E_DCT_VIOLATION, IDP_E_TOKEN_EXPIRED, IDP_E_TOKEN_INVALID, IDP_E_BINDING_MISMATCH, IDP_E_LATERAL_AUTH, IDP_E_DECISION_AUTH
+
+### reference_impl/delegation_context.py
+Delegation Context (DCTX) with state machine and trust-decay depth model.
+- Classes: DelegationContext, DelegationContextManager, DelegationBudget
+- Key methods: compute_dynamic_depth, create_child, can_subdelegate, transition, is_terminal, is_active, create_root, get_context, get_by_intent, get_chain
+- Constants: DEFAULT_MAX_CHAIN_DEPTH=3, DEFAULT_MAX_REPLANS=2
+- Trust-decay: delta_effective = min(delta_max, floor(tau/tau_o)) where tau_LOW=0.15, tau_MEDIUM=0.20, tau_HIGH=0.25, tau_CRITICAL=0.40
+- Error codes: IDP_E_DEPTH_EXCEEDED, IDP_E_INVALID_STATE_TRANSITION, IDP_E_REPLAN_LIMIT, IDP_E_CAPABILITY_ESCALATION, IDP_E_TRUST_DEPTH_EXCEEDED
+
+### reference_impl/governance_bus.py
+Append-only, hash-chained governance audit log.
+- Classes: GovernanceBus, GovernanceEntry
+- Key methods: append, _append_sync, verify_chain, compute_entry_hash, _get_last_entry_hash, enforce_retention, query_by_intent, query_by_task, query_by_entry_id
+- Constants: DEFAULT_RETENTION_DAYS=180, ROTATION_SIZE_BYTES=10MB, DEFAULT_GOVERNANCE_DIR=Path("governance_logs")
+- Error codes: IDP_E_AUDIT_INCOMPLETE, IDP_E_AUDIT_IMMUTABLE, IDP_E_AMENDMENT_TARGET_MISSING, IDP_E_VERIFICATION_REF_INVALID, IDP_E_EVIDENCE_REQUIRED, IDP_E_CHAIN_BROKEN
+
+### reference_impl/adapter_receipt.py
+Per-inference governance proof with compliance crosswalk.
+- Classes: AdapterReceipt
+- Key methods: generate, verify, save
+
+### reference_impl/basen_tuple.py
+Universal governance tuple for any tool call.
+- Classes: BaseNTuple
+- Key methods: to_dict, to_json, content_hash, sign_tuple, verify_tuple_signature
+
+## Tuple Types
+- CONTRACT: Governing agreement (allowed/denied ops, risk tier)
+- DCT: Delegation Capability Token (HMAC-SHA256 signed authorization)
+- DCTX: Delegation Context (chain depth, state machine, budget)
+- EVIDENCE: Execution artifact (result hash, duration)
+- ATTEST: Verification result (PASS/FAIL, links to EVIDENCE)
+
+## DCTX State Machine
+PROPOSED -> ISSUED -> RUNNING -> EVIDENCE_READY -> VERIFIED
+Also: EVIDENCE_READY -> REPLANNED -> PROPOSED (with replan limit)
+Also: ISSUED/RUNNING/REPLANNED -> FAILED
+Terminal: VERIFIED, FAILED
+
+## Feature Flag
+ENABLE_IDP env var (default: true). Fail-closed: governance validation is mandatory.
+
+## Requirements
+- Python 3.11+
+- No external dependencies (stdlib only)
+- pytest for tests (optional)
+
+## License
+MIT
+
+## Links
+- [Primitives schema](primitives.md)
+- [Paper claim mapping](operationalizations.md)
+- [Organization methods](organization_methods.md)
+- [Sample governance log](sample_governance_log.jsonl)
+- [Chain verification script](verify_chain.py)
+- [Test suite](tests/test_governance_tuple.py)
