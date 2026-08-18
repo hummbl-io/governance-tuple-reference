@@ -148,7 +148,7 @@ def main() -> int:
     chain_valid, breaks = verify_chain(filepath)
 
     if chain_valid:
-        print(f"OK: hash chain valid ({breaks.__len__()} breaks in {filepath.name})")
+        print(f"OK: hash chain valid ({len(breaks)} breaks in {filepath.name})")
         # Count entries
         count = 0
         with open(filepath, "r", encoding="utf-8") as f:

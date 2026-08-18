@@ -241,7 +241,12 @@ def append_tuple(
     t: BaseNTuple,
     path: str | None = None,
 ) -> None:
-    """Append a tuple to the JSONL log. Append-only -- never deletes."""
+    """Append a tuple to the JSONL log. Append-only -- never deletes.
+
+    Raises:
+        OSError: If the log directory cannot be created or the file cannot
+            be opened/written.
+    """
     if path is None:
         log_path = Path(_DEFAULT_TUPLE_LOG)
     else:

@@ -39,7 +39,7 @@ import re
 import shutil
 import threading
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import partial
@@ -684,7 +684,7 @@ class GovernanceBus:
 
     def _query(
         self,
-        predicate: callable,
+        predicate: Callable[[GovernanceEntry], bool],
         tuple_type: (
             Literal["DCTX", "CONTRACT", "EVIDENCE", "ATTEST", "DCT", "SYSTEM"] | None
         ) = None,
