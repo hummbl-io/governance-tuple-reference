@@ -31,12 +31,9 @@ Tests verify:
 """
 
 import json
-import os
 from pathlib import Path
 
 import pytest
-
-os.environ["ENABLE_IDP"] = "true"
 
 from reference_impl.delegation_token import (
     Caveat,
