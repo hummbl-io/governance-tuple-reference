@@ -9,3 +9,6 @@ governance_logs/
 *.egg-info/
 dist/
 build/
+
+# Shared lint config (symlinked, not committed)
+hummbl_lint_config
