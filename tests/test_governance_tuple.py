@@ -40,7 +40,6 @@ from pathlib import Path
 import pytest
 
 # Ensure governance enforcement is enabled for all tests
-os.environ["ENABLE_IDP"] = "true"
 
 from reference_impl.delegation_token import (
     Caveat,
