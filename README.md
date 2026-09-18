@@ -36,9 +36,9 @@ governance-tuple-reference/
     test_governance_tuple.py
   verify_chain.py           Standalone hash-chain verification script
   sample_governance_log.jsonl  50 synthetic governance entries with valid chain
-  primitives.md             Formal schema spec (CONTRACT, DCT, EVIDENCE, DCTX, ATTEST)
-  operationalizations.md    Paper claim -> reference impl location mapping
-  organization_methods.md   Institutional context and design rationale
+  docs/doctrine/primitives.md            Formal schema spec (CONTRACT, DCT, EVIDENCE, DCTX, ATTEST)
+  docs/research/operationalizations.md   Paper claim -> reference impl location mapping
+  docs/research/organization_methods.md  Institutional context and design rationale
   index.html                Landing page for reviewers
   llms.txt                  Machine-readable project summary
   LICENSE                   MIT license
@@ -52,7 +52,7 @@ The Governance Tuple framework defines five atomic record types:
 
 | Tuple | Purpose | Reference |
 |-------|---------|-----------|
-| **CONTRACT** | Governing agreement specifying allowed operations and constraints | `primitives.md` |
+| **CONTRACT** | Governing agreement specifying allowed operations and constraints | `docs/doctrine/primitives.md` |
 | **DCT** | Delegation Capability Token -- HMAC-signed authorization to act | `reference_impl/delegation_token.py` |
 | **DCTX** | Delegation Context -- tracks chain depth, state machine, budget | `reference_impl/delegation_context.py` |
 | **EVIDENCE** | Execution artifact proving an operation was performed | `reference_impl/governance_bus.py` |
