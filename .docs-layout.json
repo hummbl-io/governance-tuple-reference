@@ -1,0 +1,5 @@
+{
+  "schema": "hummbl.docs-layout.v1",
+  "root_allow": ["primitives.md", "operationalizations.md", "organization_methods.md"],
+  "exempt_dirs": []
+}
