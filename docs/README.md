@@ -7,5 +7,3 @@ regenerate rather than hand-edit.
 | Directory | Purpose | Files |
 | --- | --- | ---: |
 | `audits/` | audits, inventories and scans | 1 |
-| `doctrine/` |  | 1 |
-| `research/` | research notes and digests | 2 |
