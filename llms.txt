@@ -72,9 +72,9 @@ ENABLE_IDP env var (default: true). Fail-closed: governance validation is mandat
 MIT
 
 ## Links
-- [Primitives schema](docs/doctrine/primitives.md)
-- [Paper claim mapping](docs/research/operationalizations.md)
-- [Organization methods](docs/research/organization_methods.md)
+- [Primitives schema](primitives.md)
+- [Paper claim mapping](operationalizations.md)
+- [Organization methods](organization_methods.md)
 - [Sample governance log](sample_governance_log.jsonl)
 - [Chain verification script](verify_chain.py)
 - [Test suite](tests/test_governance_tuple.py)
