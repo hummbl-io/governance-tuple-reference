@@ -84,37 +84,10 @@ class LateralAuthError(ValueError):
         super().__init__(f"{code}: {message_type} requires delegation_ref. {detail}".strip())
 
 
-# Trust-decay depth bounds per operation class.
-# tau(i+1) = tau(i) * (1 - rho) where rho is the per-hop decay rate.
-_DEPTH_BOUNDS: dict[str, tuple[float, int]] = {
-    "routine_analysis": (0.2, 10),
-    "code_edit": (0.5, 4),
-    "commit_push": (0.7, 2),
-    "merge_kill_switch": (0.9, 1),
-    "decision_directive": (0.9, 1),
-}
-
-
-def depth_bound_lookup(op_class: str, trust: float) -> int:
-    """Return the maximum allowed invocation depth for an operation class at a given trust score.
-
-    Implements the trust-decay model: invocation chains deepen only as long as
-    tau remains above T_min for the operation class. At or below T_min,
-    DEPTH_BOUND = 0 (no further delegation permitted regardless of configured bound).
-
-    Args:
-        op_class: Operation class key.
-        trust: Current trust score tau in [0.0, 1.0].
-
-    Returns:
-        Maximum permitted invocation depth. Returns 0 if trust is at or below
-        T_min for the class, or if op_class is unrecognized (fail-closed).
-    """
-    entry = _DEPTH_BOUNDS.get(op_class)
-    if entry is None:
-        return 0
-    t_min, bound = entry
-    return bound if trust > t_min else 0
+# The single trust-decay depth model lives in delegation_context.py
+# (compute_dynamic_depth). The v2.1 second model here (_DEPTH_BOUNDS /
+# depth_bound_lookup, which allowed depth 10 for routine_analysis) was
+# deleted per remediation F5 -- one depth model only.
 
 
 @dataclass(frozen=True)

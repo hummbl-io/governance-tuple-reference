@@ -479,12 +479,15 @@ class TestNoStateChanged:
     def test_depth_exceeded_no_state_change(self):
         """Failed create_child due to depth should not modify parent."""
         from reference_impl.delegation_context import DEFAULT_MAX_CHAIN_DEPTH
+        # F5: parented contexts are built via create_child; chain to the cap.
         parent = DelegationContext(
             intent_id="i1", task_id="t1", delegator_id="a", delegatee_id="b",
-            contract_id="c1", parent_task_id="t0",
-            chain_depth=DEFAULT_MAX_CHAIN_DEPTH,
+            contract_id="c1", chain_depth=0, ops_allowed=("read",),
             status="ISSUED",
         )
+        for _ in range(DEFAULT_MAX_CHAIN_DEPTH):
+            parent, _err = parent.create_child(delegatee_id="c", contract_id="c2")
+            assert parent is not None
         original_depth = parent.chain_depth
         child, error = parent.create_child(
             delegatee_id="c", contract_id="c2",
