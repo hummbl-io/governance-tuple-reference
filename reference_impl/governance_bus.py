@@ -52,6 +52,12 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
+from reference_impl.observer import (
+    OBSERVER_KEY_ENV,
+    OBSERVER_KEY_FILENAME,
+    observer_tag_for,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -149,6 +155,7 @@ IDP_E_VERIFICATION_REF_INVALID = "IDP_E_VERIFICATION_REF_INVALID"
 IDP_E_EVIDENCE_REQUIRED = "IDP_E_EVIDENCE_REQUIRED"
 IDP_E_PII_DETECTED = "IDP_E_PII_DETECTED"
 IDP_E_SYSTEM_FORGED = "IDP_E_SYSTEM_FORGED"
+IDP_E_OBSERVER_TAG = "IDP_E_OBSERVER_TAG"
 IDP_E_CHAIN_BROKEN = "IDP_E_CHAIN_BROKEN"
 IDP_E_LATERAL_AUTH = "IDP_E_LATERAL_AUTH"
 IDP_E_DECISION_AUTH = "IDP_E_DECISION_AUTH"
@@ -278,6 +285,7 @@ class GovernanceBus:
         retention_days: int = DEFAULT_RETENTION_DAYS,
         enable_async: bool = False,
         writer_key: bytes | None = None,
+        observer_key: bytes | None = None,
     ):
         """Initialize governance bus.
 
@@ -288,6 +296,11 @@ class GovernanceBus:
             writer_key: Symmetric key for entry tags (F3). If None, loaded
                 from GT_BUS_WRITER_KEY or generated and persisted to
                 `<base_dir>/.writer_key`.
+            observer_key: Symmetric key K_O used to verify observer tags
+                on WITNESS entries (F7). If None, loaded from
+                GT_OBSERVER_KEY or `<base_dir>/.observer_key` when
+                present. The bus verifies O tags but never emits them;
+                generation lives in reference_impl.observer.Observer.
         """
         if base_dir is None:
             base_dir = DEFAULT_GOVERNANCE_DIR
@@ -308,6 +321,7 @@ class GovernanceBus:
         self._file_handle: Any = None
 
         self._writer_key = self._load_writer_key(writer_key)
+        self._observer_key = self._load_observer_key(observer_key)
 
         # F1: persisted head state + poisoned-on-mismatch startup reconcile.
         self._head_seq = 0
@@ -337,6 +351,19 @@ class GovernanceBus:
         except OSError:
             pass
         return generated
+
+    def _load_observer_key(self, key: bytes | None) -> bytes | None:
+        """K_O for verifying WITNESS observer tags (F7). The bus never
+        generates K_O -- emission is the observer's role."""
+        if key is not None:
+            return key
+        env = os.environ.get(OBSERVER_KEY_ENV)
+        if env:
+            return bytes.fromhex(env)
+        key_path = self._base_dir / OBSERVER_KEY_FILENAME
+        if key_path.exists():
+            return bytes.fromhex(key_path.read_text(encoding="utf-8").strip())
+        return None
 
     @property
     def _head_path(self) -> Path:
@@ -602,6 +629,25 @@ class GovernanceBus:
                 "writer-internal (tombstones, bypass markers)."
             )
             return False, IDP_E_SYSTEM_FORGED
+
+        # F7/G4: WITNESS entries carry tuple_data tagged under K_O by
+        # observer O. An agent-posted witness without a valid tag is
+        # rejected -- agents never hold K_O.
+        if tuple_type == "WITNESS":
+            tag = (tuple_data or {}).get("observer_tag")
+            ok = bool(
+                self._observer_key and tag
+                and hmac.compare_digest(
+                    str(tag),
+                    observer_tag_for(self._observer_key, tuple_data),
+                )
+            )
+            if not ok:
+                logger.error(
+                    "Governance entry rejected: WITNESS tuple requires a "
+                    "valid observer tag under K_O (F7; thm:gt-phantom)."
+                )
+                return False, IDP_E_OBSERVER_TAG
 
         # Evidence-before-verify: ATTEST tuples must reference EVIDENCE
         if tuple_type == "ATTEST" and verification_id is None:
