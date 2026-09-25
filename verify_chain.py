@@ -215,26 +215,82 @@ def verify_path(
     if rows and rows[0][1] is not None:
         first_seq = rows[0][1].get("seq")
         if isinstance(first_seq, int) and first_seq > GENESIS_SEQ:
-            tombstone_ok = any(
-                d is not None and d.get("tuple_type") == "SYSTEM"
+            # Bound-excuse checks mirror GovernanceBus.verify_log
+            # (R1-R3/G7-G9): the covering tombstone or boundary anchor must
+            # commit to the pruned head hash, not merely carry a seq.
+            gap_end = first_seq - 1
+            first_prev = rows[0][1].get("previous_hash")
+            first_loc = (rows[0][3], rows[0][1].get("entry_id"))
+
+            tombstones = [
+                d["tuple_data"] for _r, d, _n, _l in rows
+                if d is not None and d.get("tuple_type") == "SYSTEM"
                 and isinstance(d.get("tuple_data"), dict)
                 and d["tuple_data"].get("action") == "retention_prune"
-                and int(d["tuple_data"].get("pruned_through_seq") or 0) >= first_seq - 1
-                for _r, d, _n, _l in rows
+            ]
+            boundary_tombstone = next(
+                (t for t in tombstones
+                 if int(t.get("pruned_through_seq") or 0) == gap_end),
+                None,
             )
-            anchor_ok = any(
-                int(a["seq"]) >= first_seq - 1 for a in (anchors or [])
+            overclaim = any(
+                int(t.get("pruned_through_seq") or 0) > gap_end
+                for t in tombstones
             )
-            if tombstone_ok or anchor_ok:
-                first_loc = (rows[0][3], rows[0][1].get("entry_id"))
-                breaks = [
-                    b for b in breaks
-                    if not (
-                        str(b["expected"]).startswith("seq=1")
-                        or (b["expected"] == "null (genesis)"
-                            and (b["line"], b["entry_id"]) == first_loc)
-                    )
-                ]
+            boundary_anchor = next(
+                (a for a in (anchors or [])
+                 if int(a.get("seq", -1)) == gap_end),
+                None,
+            )
+
+            excused = False
+            if overclaim:
+                breaks.insert(0, {
+                    "line": rows[0][3],
+                    "entry_id": rows[0][1].get("entry_id", "UNKNOWN"),
+                    "segment": rows[0][2],
+                    "expected": f"tombstone pruned_through_seq <= {gap_end}",
+                    "actual": "tombstone claims to have pruned retained entries",
+                })
+            elif boundary_anchor is not None:
+                tomb_ok = (
+                    boundary_tombstone is None
+                    or boundary_tombstone.get("pruned_head_hash") == first_prev
+                )
+                excused = (
+                    first_prev is not None
+                    and boundary_anchor.get("hash") == first_prev
+                    and tomb_ok
+                )
+                if not excused:
+                    breaks.insert(0, {
+                        "line": rows[0][3],
+                        "entry_id": rows[0][1].get("entry_id", "UNKNOWN"),
+                        "segment": rows[0][2],
+                        "expected": (
+                            f"anchor hash/tombstone hash == {first_prev}"
+                        ),
+                        "actual": (
+                            f"anchor hash {boundary_anchor.get('hash')!r}, "
+                            f"tombstone {boundary_tombstone.get('pruned_head_hash') if boundary_tombstone else None!r}"
+                        ),
+                    })
+            elif boundary_tombstone is not None:
+                excused = (
+                    first_prev is not None
+                    and boundary_tombstone.get("pruned_head_hash") == first_prev
+                )
+                if not excused:
+                    breaks.insert(0, {
+                        "line": rows[0][3],
+                        "entry_id": rows[0][1].get("entry_id", "UNKNOWN"),
+                        "segment": rows[0][2],
+                        "expected": f"pruned_head_hash == {first_prev}",
+                        "actual": (
+                            f"tombstone pruned_head_hash "
+                            f"{boundary_tombstone.get('pruned_head_hash')!r}"
+                        ),
+                    })
             else:
                 breaks.insert(0, {
                     "line": rows[0][3],
@@ -243,6 +299,16 @@ def verify_path(
                     "expected": "tombstone or anchor covering pruned prefix",
                     "actual": f"log starts at seq={first_seq} with neither",
                 })
+
+            if excused:
+                breaks = [
+                    b for b in breaks
+                    if not (
+                        str(b["expected"]).startswith("seq=1")
+                        or (b["expected"] == "null (genesis)"
+                            and (b["line"], b["entry_id"]) == first_loc)
+                    )
+                ]
 
     last_seq = max(
         (d["seq"] for _r, d, _n, _l in rows

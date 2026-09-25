@@ -148,6 +148,7 @@ IDP_E_AMENDMENT_TARGET_MISSING = "IDP_E_AMENDMENT_TARGET_MISSING"
 IDP_E_VERIFICATION_REF_INVALID = "IDP_E_VERIFICATION_REF_INVALID"
 IDP_E_EVIDENCE_REQUIRED = "IDP_E_EVIDENCE_REQUIRED"
 IDP_E_PII_DETECTED = "IDP_E_PII_DETECTED"
+IDP_E_SYSTEM_FORGED = "IDP_E_SYSTEM_FORGED"
 IDP_E_CHAIN_BROKEN = "IDP_E_CHAIN_BROKEN"
 IDP_E_LATERAL_AUTH = "IDP_E_LATERAL_AUTH"
 IDP_E_DECISION_AUTH = "IDP_E_DECISION_AUTH"
@@ -591,6 +592,17 @@ class GovernanceBus:
             )
             return False, IDP_E_CALLER_SIGNATURE
 
+        # SYSTEM entries are writer-internal (governance-disable bypass
+        # markers, retention tombstones). A caller-authored tombstone would
+        # let an agent excuse a deleted prefix -- non-author review R1/G7.
+        # Internal paths write through _write_entries directly.
+        if tuple_type == "SYSTEM":
+            logger.error(
+                "Governance entry rejected: SYSTEM entries are "
+                "writer-internal (tombstones, bypass markers)."
+            )
+            return False, IDP_E_SYSTEM_FORGED
+
         # Evidence-before-verify: ATTEST tuples must reference EVIDENCE
         if tuple_type == "ATTEST" and verification_id is None:
             logger.error(
@@ -972,30 +984,100 @@ class GovernanceBus:
         ok, breaks = self._verify_entry_sequence(flat, anchors)
 
         # If the log starts above seq=1, require evidence the prefix was
-        # pruned (tombstone) or covered by an anchor beyond the gap.
+        # pruned. The excuse is *bound*, not merely present (non-author
+        # review 2026-09-25, findings R1-R3 / proposed G7-G9):
+        #   - the covering tombstone's pruned_head_hash must equal the
+        #     first retained entry's previous_hash (R2/G8);
+        #   - a tombstone claiming pruned_through_seq beyond the gap
+        #     contradicts the retained log -> fail;
+        #   - an anchor at the gap boundary must commit to the pruned
+        #     head hash, not merely carry a seq (R3/G9);
+        #   - when a boundary anchor exists it is authoritative: a
+        #     tombstone contradicting it fails (G7).
         if flat and flat[0][1] is not None:
             first_seq = flat[0][1].get("seq")
             if isinstance(first_seq, int) and first_seq > 1:
-                tombstone_ok = any(
-                    d is not None and d.get("tuple_type") == "SYSTEM"
+                gap_end = first_seq - 1
+                first_prev = flat[0][1].get("previous_hash")
+                first_loc = (flat[0][3], flat[0][1].get("entry_id"))
+
+                tombstones = [
+                    d["tuple_data"] for _r, d, _n, _l in flat
+                    if d is not None and d.get("tuple_type") == "SYSTEM"
                     and isinstance(d.get("tuple_data"), dict)
                     and d["tuple_data"].get("action") == "retention_prune"
-                    and int(d["tuple_data"].get("pruned_through_seq") or 0) >= first_seq - 1
-                    for _r, d, _n, _l in flat
+                ]
+                boundary_tombstone = next(
+                    (t for t in tombstones
+                     if int(t.get("pruned_through_seq") or 0) == gap_end),
+                    None,
                 )
-                anchor_ok = any(
-                    int(a["seq"]) >= first_seq - 1 for a in (anchors or [])
+                overclaim = any(
+                    int(t.get("pruned_through_seq") or 0) > gap_end
+                    for t in tombstones
                 )
-                if tombstone_ok or anchor_ok:
-                    first_loc = (flat[0][3], flat[0][1].get("entry_id"))
-                    breaks = [
-                        b for b in breaks
-                        if not (
-                            b["expected"].startswith("seq=1")
-                            or (b["expected"] == "null (genesis)"
-                                and (b["line"], b["entry_id"]) == first_loc)
-                        )
-                    ]
+                boundary_anchor = next(
+                    (a for a in (anchors or [])
+                     if int(a.get("seq", -1)) == gap_end),
+                    None,
+                )
+
+                excused = False
+                if overclaim:
+                    breaks.insert(0, {
+                        "line": flat[0][3],
+                        "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                        "segment": flat[0][2],
+                        "expected": f"tombstone pruned_through_seq <= {gap_end}",
+                        "actual": "tombstone claims to have pruned retained entries",
+                    })
+                elif boundary_anchor is not None:
+                    # The external anchor binds the boundary. Its hash must
+                    # equal the last pruned entry's hash (= first retained
+                    # previous_hash); a disagreeing tombstone also fails.
+                    tomb_ok = (
+                        boundary_tombstone is None
+                        or boundary_tombstone.get("pruned_head_hash") == first_prev
+                    )
+                    excused = (
+                        first_prev is not None
+                        and boundary_anchor.get("hash") == first_prev
+                        and tomb_ok
+                    )
+                    if not excused:
+                        breaks.insert(0, {
+                            "line": flat[0][3],
+                            "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                            "segment": flat[0][2],
+                            "expected": (
+                                f"anchor hash/tombstone hash == {first_prev}"
+                            ),
+                            "actual": (
+                                f"anchor hash "
+                                f"{boundary_anchor.get('hash')!r}, tombstone "
+                                f"{boundary_tombstone.get('pruned_head_hash') if boundary_tombstone else None!r}"
+                            ),
+                        })
+                elif boundary_tombstone is not None:
+                    # Agent-adversary scope only (R1 owner decision): with no
+                    # boundary anchor, the tombstone still must bind its
+                    # recorded head hash to the first retained previous_hash.
+                    excused = (
+                        first_prev is not None
+                        and boundary_tombstone.get("pruned_head_hash")
+                        == first_prev
+                    )
+                    if not excused:
+                        breaks.insert(0, {
+                            "line": flat[0][3],
+                            "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                            "segment": flat[0][2],
+                            "expected": f"pruned_head_hash == {first_prev}",
+                            "actual": (
+                                f"tombstone pruned_head_hash "
+                                f"{boundary_tombstone.get('pruned_head_hash')!r}"
+                            ),
+                        })
                 else:
                     breaks.insert(0, {
                         "line": flat[0][3],
@@ -1004,6 +1086,16 @@ class GovernanceBus:
                         "expected": "tombstone or anchor covering pruned prefix",
                         "actual": f"log starts at seq={first_seq} with neither",
                     })
+
+                if excused:
+                    breaks = [
+                        b for b in breaks
+                        if not (
+                            b["expected"].startswith("seq=1")
+                            or (b["expected"] == "null (genesis)"
+                                and (b["line"], b["entry_id"]) == first_loc)
+                        )
+                    ]
 
         # Anchors beyond the log tail: a checkpointed entry that is missing
         # means tail truncation since the anchor was published (T2).

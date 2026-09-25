@@ -51,6 +51,7 @@ from reference_impl.governance_bus import (
     IDP_E_CALLER_SIGNATURE,
     IDP_E_GOVERNANCE_DISABLED,
     IDP_E_HEAD_MISMATCH,
+    IDP_E_SYSTEM_FORGED,
     GovernanceBus,
     GovernanceEntry,
 )
@@ -371,9 +372,167 @@ class TestT8Retention:
         for i in range(40):
             bus.append("i", f"t{i}", "DCTX", {"payload": "q" * 30, "n": i})
         _force_date(bus, None)
+        for i in range(10):
+            bus.append("i", f"new{i}", "DCTX", {"payload": "q" * 30, "n": i})
         bus.enforce_retention()
         valid, breaks = bus.verify_log()
         assert valid is True, breaks
+
+        # G10 (R4): strip the tombstone line -- the uncovered gap must fail.
+        tomb = next(
+            e for e in _all_entries(bus)
+            if e.tuple_type == "SYSTEM"
+            and e.tuple_data.get("action") == "retention_prune"
+        )
+        seg = next(tmp_path.glob("governance-*.jsonl"))
+        kept = [
+            ln for ln in seg.read_text().splitlines()
+            if ln.strip() and json.loads(ln)["entry_id"] != tomb.entry_id
+        ]
+        bus.close()
+        seg.write_text("\n".join(kept) + "\n")
+        bus2 = GovernanceBus(base_dir=tmp_path, retention_days=30)
+        valid, breaks = bus2.verify_log()
+        assert valid is False
+        assert any("tombstone" in b["expected"] for b in breaks)
+
+
+# ---------------------------------------------------------------------------
+# G7-G10 -- bound excuses (non-author review R1-R4, 2026-09-25)
+# A gap may only be excused by evidence bound to the pruned head hash.
+# ---------------------------------------------------------------------------
+
+
+def _pruned_log(tmp_path, monkeypatch, n_old=40, n_new=15):
+    """Build a bus with a retention-pruned log. Returns (bus, gap_end)."""
+    monkeypatch.setattr(gb, "ROTATION_SIZE_BYTES", 200)
+    bus = GovernanceBus(base_dir=tmp_path, retention_days=30)
+    _force_date(bus, "2026-01-01")
+    for i in range(n_old):
+        bus.append("i", f"t{i}", "DCTX", {"payload": "q" * 30, "n": i})
+    _force_date(bus, None)
+    for i in range(n_new):
+        bus.append("i", f"new{i}", "DCTX", {"payload": "q" * 30, "n": i})
+    bus.enforce_retention()
+    entries = sorted(_all_entries(bus), key=lambda e: e.seq or 0)
+    first_seq = min(e.seq for e in entries if e.seq)
+    return bus, first_seq - 1
+
+
+def _write_forged_tombstone(bus: GovernanceBus, through_seq: int,
+                            head_hash: str) -> None:
+    """Append a SYSTEM tombstone through the internal writer path
+    (properly tagged -- simulates an operator adversary holding K_W)."""
+    tomb = GovernanceEntry(
+        timestamp="",
+        entry_id=bus._generate_entry_id(),
+        intent_id="system",
+        task_id="system",
+        tuple_type="SYSTEM",
+        tuple_data={
+            "action": "retention_prune",
+            "pruned_segments": 1,
+            "pruned_through_seq": through_seq,
+            "pruned_head_hash": head_hash,
+        },
+    )
+    with bus._lock:
+        bus._write_entries([tomb])
+
+
+class TestBoundExcuses:
+    def test_g7_forged_tombstone_overclaim_fails(self, tmp_path, monkeypatch):
+        """A tombstone claiming coverage past the gap fails verification."""
+        bus, gap_end = _pruned_log(tmp_path, monkeypatch)
+        valid, _ = bus.verify_log()
+        assert valid
+        _write_forged_tombstone(bus, through_seq=gap_end + 1,
+                                head_hash="00" * 32)
+        valid, breaks = bus.verify_log()
+        assert valid is False
+        assert any("pruned_through_seq" in b["expected"] for b in breaks)
+
+    def test_g7b_public_append_cannot_write_tombstone(self, tmp_path, monkeypatch):
+        """Agent-adversary path closed: public append refuses SYSTEM."""
+        bus, gap_end = _pruned_log(tmp_path, monkeypatch)
+        ok, err = bus.append(
+            "i", "t", "SYSTEM",
+            {"action": "retention_prune",
+             "pruned_through_seq": gap_end + 50,
+             "pruned_head_hash": "00" * 32},
+        )
+        assert not ok
+        assert err == IDP_E_SYSTEM_FORGED
+
+    def test_g8_tombstone_hash_must_match(self, tmp_path, monkeypatch):
+        """Boundary tombstone with a wrong pruned_head_hash fails."""
+        monkeypatch.setattr(gb, "ROTATION_SIZE_BYTES", 200)
+        bus = GovernanceBus(base_dir=tmp_path, retention_days=30)
+        _force_date(bus, "2026-01-01")
+        for i in range(5):
+            bus.append("i", f"t{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        day1 = bus._base_dir / "governance-2026-01-01.jsonl"
+        last_line = day1.read_text().splitlines()[-1]
+        pruned_hash = bus.compute_entry_hash(last_line)
+        _force_date(bus, "2026-01-02")
+        for i in range(10):
+            bus.append("i", f"n{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        for p in tmp_path.glob("governance-2026-01-01*"):
+            p.unlink()
+        # Forged boundary tombstone with wrong head hash
+        _write_forged_tombstone(bus, through_seq=5, head_hash="00" * 32)
+        valid, breaks = bus.verify_log()
+        assert valid is False
+        assert any("pruned_head_hash" in b["expected"] for b in breaks)
+        # Correct hash excuses the gap (sanity: same machinery, right hash)
+        bus2_dir = tmp_path / "second"
+        bus2_dir.mkdir()
+        bus2 = GovernanceBus(base_dir=bus2_dir, retention_days=30)
+        _force_date(bus2, "2026-01-01")
+        for i in range(5):
+            bus2.append("i", f"t{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        last_line2 = (bus2_dir / "governance-2026-01-01.jsonl").read_text().splitlines()[-1]
+        pruned_hash2 = bus2.compute_entry_hash(last_line2)
+        _force_date(bus2, "2026-01-02")
+        for i in range(10):
+            bus2.append("i", f"n{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        for p in bus2_dir.glob("governance-2026-01-01*"):
+            p.unlink()
+        _write_forged_tombstone(bus2, through_seq=5, head_hash=pruned_hash2)
+        valid, breaks = bus2.verify_log()
+        assert valid is True, breaks
+
+    def test_g9_anchor_must_commit_to_hash(self, tmp_path, monkeypatch):
+        """A boundary anchor with matching seq but wrong hash fails."""
+        monkeypatch.setattr(gb, "ROTATION_SIZE_BYTES", 200)
+        bus = GovernanceBus(base_dir=tmp_path, retention_days=30)
+        _force_date(bus, "2026-01-01")
+        for i in range(5):
+            bus.append("i", f"t{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        day1 = bus._base_dir / "governance-2026-01-01.jsonl"
+        pruned_hash = bus.compute_entry_hash(day1.read_text().splitlines()[-1])
+        _force_date(bus, "2026-01-02")
+        for i in range(10):
+            bus.append("i", f"n{i}", "DCTX", {"payload": "q" * 30, "n": i})
+        for p in tmp_path.glob("governance-2026-01-01*"):
+            p.unlink()
+
+        # seq-only anchor (wrong hash) must NOT excuse the gap
+        valid, breaks = bus.verify_log(
+            anchors=[{"seq": 5, "hash": "00" * 32}]
+        )
+        assert valid is False
+        # anchor bound to the true pruned head hash excuses it
+        valid, breaks = bus.verify_log(
+            anchors=[{"seq": 5, "hash": pruned_hash}]
+        )
+        assert valid is True, breaks
+        # a contradicting tombstone loses to the bound anchor (G7/G9)
+        _write_forged_tombstone(bus, through_seq=5, head_hash="11" * 32)
+        valid, breaks = bus.verify_log(
+            anchors=[{"seq": 5, "hash": pruned_hash}]
+        )
+        assert valid is False
 
 
 # ---------------------------------------------------------------------------

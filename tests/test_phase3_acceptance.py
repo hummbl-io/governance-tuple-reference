@@ -206,7 +206,7 @@ class TestT14ByteIdenticalPassThrough:
         rejection -- F8 removed field-name allowlists entirely."""
         bus = GovernanceBus(base_dir=str(tmp_path), enable_async=False)
         data = {"name": "svc", "token": "tok-9f546874", "secret": "s3ssion"}
-        ok, err = bus.append("i", "t", "SYSTEM", dict(data))
+        ok, err = bus.append("i", "t", "DCTX", dict(data))
         assert ok, err
         log = sorted(tmp_path.glob("governance-*.jsonl"))[0]
         entry = json.loads(log.read_text().splitlines()[-1])
