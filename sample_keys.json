@@ -1,0 +1,6 @@
+{
+  "_warning": "TEST-ONLY keys for verifying the sample log. They protect nothing.",
+  "writer_key_hex (K_W)": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "observer_key_hex (K_O)": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "issuer_secret_utf8 (K_I)": "sample-issuer-secret-test-only"
+}
