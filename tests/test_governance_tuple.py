@@ -322,16 +322,25 @@ class TestCapabilityAttenuation:
 
     def test_depth_exceeded_rejected(self):
         """Subdelegation beyond DEFAULT_MAX_CHAIN_DEPTH should fail."""
+        # F5: parented contexts are built via create_child only -- chain to
+        # the max depth, then assert one more delegation is refused.
         ctx = DelegationContext(
             intent_id="intent-001",
             task_id="task-001",
             delegator_id="agent-alpha",
             delegatee_id="agent-beta",
             contract_id="contract-001",
-            parent_task_id="task-000",
-            chain_depth=DEFAULT_MAX_CHAIN_DEPTH,
+            chain_depth=0,
+            ops_allowed=("read",),
             status="ISSUED",
         )
+        for _ in range(DEFAULT_MAX_CHAIN_DEPTH):
+            ctx, error = ctx.create_child(
+                delegatee_id="agent-next",
+                contract_id="contract-x",
+            )
+            assert ctx is not None
+        assert ctx.chain_depth == DEFAULT_MAX_CHAIN_DEPTH
         child, error = ctx.create_child(
             delegatee_id="agent-gamma",
             contract_id="contract-002",
@@ -539,17 +548,24 @@ class TestDynamicDepth:
 
     def test_dynamic_depth_in_create_child(self):
         """create_child with trust_score should use dynamic depth."""
+        # F5: build the depth-2 parent through create_child.
         parent = DelegationContext(
             intent_id="intent-001",
             task_id="task-001",
             delegator_id="agent-alpha",
             delegatee_id="agent-beta",
             contract_id="contract-001",
-            parent_task_id="task-000",
-            chain_depth=2,
+            chain_depth=0,
             risk_tier="CRITICAL",
             status="ISSUED",
         )
+        for _ in range(2):
+            parent, error = parent.create_child(
+                delegatee_id="agent-next",
+                contract_id="contract-x",
+            )
+            assert parent is not None
+        assert parent.chain_depth == 2
         # trust=0.3, CRITICAL -> dynamic_max=0, chain_depth+1=3 > 0
         child, error = parent.create_child(
             delegatee_id="agent-gamma",
@@ -746,10 +762,12 @@ class TestContextManager:
             delegator_id="agent-alpha",
             delegatee_id="agent-beta",
             contract_id="contract-001",
+            ops_allowed=("read", "write"),
         )
         assert ctx.chain_depth == 0
         assert ctx.parent_task_id is None
         assert ctx.status == "PROPOSED"
+        assert ctx.ops_allowed == ("read", "write")
 
     def test_get_context(self):
         """get_context should return the context by task_id."""
@@ -797,6 +815,7 @@ class TestContextManager:
             delegator_id="agent-alpha",
             delegatee_id="agent-beta",
             contract_id="contract-001",
+            ops_allowed=("read", "write"),
         )
         mgr._contexts[root.task_id] = root
 

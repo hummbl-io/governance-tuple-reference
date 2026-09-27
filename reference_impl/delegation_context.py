@@ -68,6 +68,12 @@ def compute_dynamic_depth(
 
     Implements the paper formula: delta_effective = min(delta_max, floor(t_score / tau_o))
 
+    F5: the floor is computed in fixed-point integers
+    (int(round(t*10000)) // int(round(tau*10000))) -- never float floor or
+    round(t/tau), which are fail-open on binary representation edges.
+    Unknown risk tiers return 0 (fail-closed; the v2.1 LOW fallback was
+    fail-open).
+
     Args:
         trust_score: Beta trust score tau in [0.0, 1.0]
         risk_tier: One of LOW, MEDIUM, HIGH, CRITICAL
@@ -76,8 +82,12 @@ def compute_dynamic_depth(
     Returns:
         Maximum permitted chain depth for this delegatee and operation class.
     """
-    tau = _TAU_BY_RISK_TIER.get(risk_tier, _TAU_BY_RISK_TIER["LOW"])
-    return min(delta_max, int(trust_score // tau))
+    tau = _TAU_BY_RISK_TIER.get(risk_tier)
+    if tau is None:
+        return 0  # unknown tier -> no delegation depth (fail-closed)
+    scaled_t = int(round(trust_score * 10_000))
+    scaled_tau = int(round(tau * 10_000))
+    return min(delta_max, scaled_t // scaled_tau)
 
 
 DCTXStatus = Literal[
@@ -91,7 +101,7 @@ DCTXStatus = Literal[
 ]
 
 
-@dataclass
+@dataclass(frozen=True)
 class DelegationBudget:
     """Budget constraints for delegation."""
 
@@ -108,9 +118,12 @@ class DelegationBudget:
         return bool(self.max_wall_time_seconds > 0 and seconds > self.max_wall_time_seconds)
 
 
-@dataclass
+@dataclass(frozen=True)
 class DelegationContext:
     """Delegation Context Tuple (DCTX).
+
+    Frozen (F5/T10d): no field may be rebound after construction; the state
+    machine mutates status/replan_count internally via object.__setattr__.
 
     Represents the full context of a single delegation event with
     chain depth tracking and state machine enforcement.
@@ -153,6 +166,13 @@ class DelegationContext:
     replan_count: int = 0
     ops_allowed: tuple[str, ...] = ()
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Construction provenance (F5/T10c). _parent_context is supplied only by
+    # create_child; _rehydrate marks a log-deserialized entry whose
+    # attenuation was already enforced at write time. Neither is serialized.
+    _parent_context: "DelegationContext | None" = field(
+        default=None, repr=False, compare=False
+    )
+    _rehydrate: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self):
         """Validate invariants after initialization."""
@@ -165,6 +185,36 @@ class DelegationContext:
                 raise ValueError("Non-root task must have chain_depth > 0")
             if self.parent_task_id is None and self.chain_depth != 0:
                 raise ValueError("Root task must have chain_depth = 0")
+            if self.parent_task_id is not None and not self._rehydrate:
+                # F5/T10c: a parented context must carry its parent so the
+                # attenuation invariant can be checked at construction.
+                parent = self._parent_context
+                if parent is None:
+                    raise ValueError(
+                        "IDP_E_CAPABILITY_ESCALATION: parented contexts must "
+                        "be created via create_child (or _rehydrate=True for "
+                        "log deserialization)"
+                    )
+                if parent.task_id != self.parent_task_id:
+                    raise ValueError(
+                        "IDP_E_CAPABILITY_ESCALATION: _parent_context.task_id "
+                        "does not match parent_task_id"
+                    )
+                if parent.intent_id != self.intent_id:
+                    raise ValueError(
+                        "IDP_E_CAPABILITY_ESCALATION: child intent_id must "
+                        "match parent intent_id"
+                    )
+                if self.chain_depth != parent.chain_depth + 1:
+                    raise ValueError(
+                        "IDP_E_DEPTH_EXCEEDED: child chain_depth must be "
+                        "parent.chain_depth + 1"
+                    )
+                if not set(self.ops_allowed).issubset(set(parent.ops_allowed)):
+                    raise ValueError(
+                        "IDP_E_CAPABILITY_ESCALATION: child ops_allowed must "
+                        "be a subset of parent ops_allowed"
+                    )
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to dictionary."""
@@ -217,6 +267,9 @@ class DelegationContext:
             replan_count=data.get("replan_count", 0),
             ops_allowed=tuple(data.get("ops_allowed", ())),
             metadata=data.get("metadata", {}),
+            # Log-deserialized entries were attenuation-checked when created;
+            # the verifier re-checks ops subsets at read time (F6).
+            _rehydrate=True,
         )
 
     def transition(self, new_status: DCTXStatus) -> tuple[bool, str | None]:
@@ -247,7 +300,7 @@ class DelegationContext:
             "PROPOSED": ["ISSUED"],
             "ISSUED": ["RUNNING", "FAILED"],
             "RUNNING": ["EVIDENCE_READY", "FAILED"],
-            "EVIDENCE_READY": ["VERIFIED", "REPLANNED"],
+            "EVIDENCE_READY": ["VERIFIED", "REPLANNED", "FAILED"],
             "REPLANNED": ["PROPOSED", "FAILED"],
             "VERIFIED": [],
             "FAILED": [],
@@ -261,10 +314,12 @@ class DelegationContext:
             if self.replan_count >= DEFAULT_MAX_REPLANS:
                 return False, IDP_E_REPLAN_LIMIT
 
+        # Frozen dataclass: internal state-machine fields mutate via
+        # object.__setattr__; external rebinding raises FrozenInstanceError.
         if new_status == "REPLANNED":
-            self.replan_count += 1
+            object.__setattr__(self, "replan_count", self.replan_count + 1)
 
-        self.status = new_status
+        object.__setattr__(self, "status", new_status)
         return True, None
 
     def can_subdelegate(
@@ -327,13 +382,14 @@ class DelegationContext:
             if not can_sub:
                 return None, error
 
-        # Monotonic capability attenuation: child ops must be subset of parent ops.
+        # Monotonic capability attenuation (F5/T10b): child ops must be a
+        # subset of parent ops, unconditionally. The v2.1 guard
+        # `if self.ops_allowed and child_ops` skipped the check whenever
+        # either side was empty -- `read -> () -> delete,admin` escalated.
+        # The empty set grants no operations: () permits only () children.
         child_ops = ops_allowed if ops_allowed is not None else self.ops_allowed
-        if self.ops_allowed and child_ops:
-            parent_set = set(self.ops_allowed)
-            child_set = set(child_ops)
-            if not child_set.issubset(parent_set):
-                return None, IDP_E_CAPABILITY_ESCALATION
+        if not set(child_ops).issubset(set(self.ops_allowed)):
+            return None, IDP_E_CAPABILITY_ESCALATION
 
         return (
             DelegationContext(
@@ -353,6 +409,7 @@ class DelegationContext:
                 ),
                 ops_allowed=child_ops,
                 status="PROPOSED",
+                _parent_context=self,
             ),
             None,
         )
@@ -387,16 +444,25 @@ class DelegationContextManager:
         delegator_id: str,
         delegatee_id: str,
         contract_id: str,
+        ops_allowed: tuple[str, ...] = (),
         risk_tier: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"] = "MEDIUM",
         budget: DelegationBudget | None = None,
     ) -> DelegationContext:
         """Create root delegation context (chain_depth = 0).
+
+        F5/T10a: the root's ops_allowed is the delegator's granted op set --
+        the attenuation baseline every descendant must subset. The empty
+        set grants no operations: children of an empty-ops root can only
+        carry () themselves.
 
         Args:
             intent_id: Root intent identifier
             delegator_id: Agent issuing delegation
             delegatee_id: Agent receiving delegation
             contract_id: Contract ID
+            ops_allowed: Operations granted at the root (default () --
+                explicit but grants nothing; pass the delegator's op set
+                for delegation to be meaningful)
             risk_tier: Risk classification
             budget: Resource constraints
 
@@ -413,6 +479,7 @@ class DelegationContextManager:
             chain_depth=0,
             budget=budget or DelegationBudget(),
             status="PROPOSED",
+            ops_allowed=tuple(ops_allowed),
         )
         self._contexts[ctx.task_id] = ctx
         return ctx
