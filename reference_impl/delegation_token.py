@@ -153,6 +153,25 @@ class TokenBinding:
         return cls(task_id=d["task_id"], contract_id=d["contract_id"])
 
 
+def _canonical_json(obj: Any) -> bytes:
+    """Canonical JSON encoding (canon): sorted keys, compact separators."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def compute_contract_digest(contract: dict[str, Any]) -> str:
+    """H(canon(C)): SHA-256 of the contract's canonical JSON form.
+
+    F4: tokens sign this digest so a logged CONTRACT entry's content is
+    bound to every token issued under it -- altering the logged contract
+    breaks the digest check (G3).
+    """
+    if not isinstance(contract, dict):
+        raise ValueError(
+            f"compute_contract_digest requires dict, got {type(contract).__name__}"
+        )
+    return hashlib.sha256(_canonical_json(contract)).hexdigest()
+
+
 @dataclass(frozen=True)
 class DelegationCapabilityToken:
     """HMAC-SHA256 signed delegation capability token.
@@ -169,6 +188,10 @@ class DelegationCapabilityToken:
         expiry: ISO8601 timestamp or None for no expiry
         binding: Links token to specific task/contract
         signature: HMAC-SHA256 signature for integrity
+        issued_at: ISO8601 issuance timestamp (F4 -- signed, not caller-set)
+        contract_digest: H(canon(C)) binding token to contract content (F4)
+        parent_token_id: Token this was delegated from, if any (F4)
+        nonce: Unique-per-token random value (F4)
     """
 
     token_id: str
@@ -180,6 +203,10 @@ class DelegationCapabilityToken:
     expiry: str | None = None
     binding: TokenBinding | None = None
     signature: str = ""
+    issued_at: str = ""
+    contract_digest: str = ""
+    parent_token_id: str | None = None
+    nonce: str = ""
 
     def to_dict(self, *, include_signature: bool = False) -> dict[str, Any]:
         """Serialize token to dictionary.
@@ -215,6 +242,10 @@ class DelegationCapabilityToken:
                 if self.binding
                 else None
             ),
+            "issued_at": self.issued_at,
+            "contract_digest": self.contract_digest,
+            "parent_token_id": self.parent_token_id,
+            "nonce": self.nonce,
         }
         if include_signature:
             d["signature"] = self.signature
@@ -269,6 +300,10 @@ class DelegationCapabilityToken:
             expiry=d.get("expiry"),
             binding=binding,
             signature=d.get("signature", ""),
+            issued_at=d.get("issued_at", ""),
+            contract_digest=d.get("contract_digest", ""),
+            parent_token_id=d.get("parent_token_id"),
+            nonce=d.get("nonce", ""),
         )
 
     def to_json(self) -> str:
@@ -389,12 +424,17 @@ class DelegationTokenManager:
     All operations are feature-flagged via ENABLE_IDP.
     """
 
-    def __init__(self, secret: bytes | None = None):
+    def __init__(self, secret: bytes | None = None, bus: Any | None = None):
         """Initialize token manager with signing secret.
 
         Args:
             secret: HMAC secret. If None, reads from DCT_SECRET env var
                     or generates ephemeral key (not recommended for production).
+            bus: Optional GovernanceBus. When set, create_token enforces
+                 log-before-release (F4): the signed DCT is appended to the
+                 governance log and the token is returned only after the
+                 writer acknowledges the append. A failed append means no
+                 token is handed out.
         """
         if secret is None:
             secret_str = os.environ.get("DCT_SECRET")
@@ -407,6 +447,7 @@ class DelegationTokenManager:
                 )
                 secret = os.urandom(32)
         self._secret = secret
+        self._bus = bus
 
     def create_token(
         self,
@@ -417,8 +458,19 @@ class DelegationTokenManager:
         resource_selectors: list[ResourceSelector] | None = None,
         caveats: list[Caveat] | None = None,
         expiry_minutes: int | None = 120,
+        contract: dict[str, Any] | None = None,
+        parent_token_id: str | None = None,
+        intent_id: str | None = None,
     ) -> DelegationCapabilityToken:
         """Create a new HMAC-SHA256 signed DCT.
+
+        F4 payload: the signed content includes issued_at (issuer-stamped),
+        contract_digest = H(canon(contract)) when a contract is given,
+        parent_token_id, and a per-token nonce.
+
+        Log-before-release (F4): if this manager was constructed with a
+        bus, the signed token is appended as a DCT entry first and the
+        token is returned only after the writer acknowledges the append.
 
         Args:
             issuer: Agent granting the capability
@@ -428,12 +480,18 @@ class DelegationTokenManager:
             resource_selectors: Accessible resources (default: all)
             caveats: Constraints on use (default: none)
             expiry_minutes: Minutes until expiry (None = no expiry, default: 120)
+            contract: Contract content dict; its canonical digest is signed
+                into the token (F4). None leaves contract_digest empty.
+            parent_token_id: Token this capability was delegated from (F4)
+            intent_id: Intent identifier for the DCT log entry
+                (default: binding.contract_id)
 
         Returns:
             Signed DelegationCapabilityToken
 
         Raises:
-            RuntimeError: If ENABLE_IDP is False
+            RuntimeError: If ENABLE_IDP is False, or if a configured bus
+                refuses the DCT log append (log-before-release).
         """
         if not _is_idp_enabled():
             raise RuntimeError("Governance is disabled. Set ENABLE_IDP=true to create tokens.")
@@ -453,11 +511,17 @@ class DelegationTokenManager:
             expiry=expiry,
             binding=binding,
             signature="",
+            issued_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            contract_digest=(
+                compute_contract_digest(contract) if contract is not None else ""
+            ),
+            parent_token_id=parent_token_id,
+            nonce=uuid.uuid4().hex,
         )
 
         sig = _compute_signature(token.to_dict(), self._secret)
 
-        return DelegationCapabilityToken(
+        signed = DelegationCapabilityToken(
             token_id=token.token_id,
             issuer=token.issuer,
             subject=token.subject,
@@ -467,7 +531,29 @@ class DelegationTokenManager:
             expiry=token.expiry,
             binding=token.binding,
             signature=sig,
+            issued_at=token.issued_at,
+            contract_digest=token.contract_digest,
+            parent_token_id=token.parent_token_id,
+            nonce=token.nonce,
         )
+
+        if self._bus is not None:
+            # Log-before-release (F4): the issuer hands the token out only
+            # after W acknowledges the DCT entry. No ack -> no token.
+            ok, err = self._bus.append(
+                intent_id=intent_id or binding.contract_id,
+                task_id=binding.task_id,
+                tuple_type="DCT",
+                tuple_data=signed.to_dict(include_signature=True),
+                contract_id=binding.contract_id,
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"IDP_E_LOG_BEFORE_RELEASE: DCT log append failed: {err}. "
+                    "Token not released."
+                )
+
+        return signed
 
     def validate_token(
         self,

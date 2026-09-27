@@ -56,49 +56,65 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Inline PII redaction (replaces external scrubber dependency)
+# PII detection -- F8 (scrubber rule)
+#
+# v2.1 rewrote tuple_data in place before hashing: UUID tails became
+# [REDACTED:phone], dotted ids became [REDACTED:ip], and a field-name
+# allowlist (_PII_KEYS) wiped `name`/`token` values. Any signed or hashed
+# object (DCT, digest-bearing CONTRACT) no longer verified after logging
+# (T9), and ~10% of UUIDs / ~28% of SHA-256 hex strings were mangled (T14).
+#
+# F8: the bus never modifies tuple_data. PII handling is the caller's job --
+# redact at the source before signing or hashing, or store a separate
+# unauthenticated redacted view. The bus's role is detection: content
+# matching high-confidence PII patterns is refused with IDP_E_PII_DETECTED
+# so no unredacted PII ever enters the immutable chain. Structural
+# identifiers (UUIDs, hex digests) are masked before scanning -- not a
+# field-name allowlist: masking applies to any string regardless of key.
 # ---------------------------------------------------------------------------
+
+# Structural identifier shapes masked before PII scanning so identifiers
+# are never mistaken for PII. Not content rewriting -- detection only.
+_STRUCT_MASK_PATTERNS = [
+    re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+               r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"),  # UUID
+    re.compile(r"\b[0-9a-fA-F]{64}\b"),                # SHA-256 hex
+    re.compile(r"\b[0-9a-fA-F]{32}\b"),                # 32-hex ids
+]
 
 _PII_PATTERNS: list[tuple[str, str]] = [
     # Email addresses
-    (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "[REDACTED:email]"),
-    # Phone numbers (US and international)
-    (r"\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{4}", "[REDACTED:phone]"),
+    (r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", "email"),
+    # Phone numbers (US national and international), word-bounded
+    (r"(?<![\w-])(\+\d{1,3}[-.\s])?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b", "phone"),
     # SSN-like patterns
-    (r"\b\d{3}-\d{2}-\d{4}\b", "[REDACTED:ssn]"),
+    (r"(?<![\w-])\d{3}-\d{2}-\d{4}(?![\w-])", "ssn"),
     # IPv4 addresses
-    (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[REDACTED:ip]"),
+    (r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])", "ip"),
 ]
 
-_PII_KEYS = frozenset({
-    "email", "phone", "ssn", "address", "name", "password",
-    "api_key", "token", "secret", "credential",
-})
 
+def _detect_pii(data: Any, _hits: list[str] | None = None) -> list[str]:
+    """Detect likely PII in payload data. Returns labels of patterns found.
 
-def _scrub_pii(data: Any) -> Any:
-    """Inline PII redaction function.
-
-    Replaces PII (emails, phones, SSNs, IPs) with redaction markers,
-    and redacts values for known sensitive keys. Recurses into dicts
-    and lists.
+    Read-only: never modifies or returns a rewritten copy of the data.
+    Callers redact at the source (F8); the bus refuses flagged payloads.
     """
+    hits = _hits if _hits is not None else []
     if isinstance(data, dict):
-        result = {}
-        for key, value in data.items():
-            if isinstance(key, str) and key.lower() in _PII_KEYS:
-                result[key] = "[REDACTED]"
-            else:
-                result[key] = _scrub_pii(value)
-        return result
-    if isinstance(data, list):
-        return [_scrub_pii(item) for item in data]
-    if isinstance(data, str):
-        scrubbed = data
-        for pattern, replacement in _PII_PATTERNS:
-            scrubbed = re.sub(pattern, replacement, scrubbed)
-        return scrubbed
-    return data
+        for value in data.values():
+            _detect_pii(value, hits)
+    elif isinstance(data, (list, tuple)):
+        for item in data:
+            _detect_pii(item, hits)
+    elif isinstance(data, str):
+        masked = data
+        for pat in _STRUCT_MASK_PATTERNS:
+            masked = pat.sub("X", masked)
+        for pattern, label in _PII_PATTERNS:
+            if re.search(pattern, masked) and label not in hits:
+                hits.append(label)
+    return hits
 
 
 def _is_idp_enabled() -> bool:
@@ -131,6 +147,8 @@ IDP_E_AUDIT_IMMUTABLE = "IDP_E_AUDIT_IMMUTABLE"
 IDP_E_AMENDMENT_TARGET_MISSING = "IDP_E_AMENDMENT_TARGET_MISSING"
 IDP_E_VERIFICATION_REF_INVALID = "IDP_E_VERIFICATION_REF_INVALID"
 IDP_E_EVIDENCE_REQUIRED = "IDP_E_EVIDENCE_REQUIRED"
+IDP_E_PII_DETECTED = "IDP_E_PII_DETECTED"
+IDP_E_SYSTEM_FORGED = "IDP_E_SYSTEM_FORGED"
 IDP_E_CHAIN_BROKEN = "IDP_E_CHAIN_BROKEN"
 IDP_E_LATERAL_AUTH = "IDP_E_LATERAL_AUTH"
 IDP_E_DECISION_AUTH = "IDP_E_DECISION_AUTH"
@@ -574,6 +592,17 @@ class GovernanceBus:
             )
             return False, IDP_E_CALLER_SIGNATURE
 
+        # SYSTEM entries are writer-internal (governance-disable bypass
+        # markers, retention tombstones). A caller-authored tombstone would
+        # let an agent excuse a deleted prefix -- non-author review R1/G7.
+        # Internal paths write through _write_entries directly.
+        if tuple_type == "SYSTEM":
+            logger.error(
+                "Governance entry rejected: SYSTEM entries are "
+                "writer-internal (tombstones, bypass markers)."
+            )
+            return False, IDP_E_SYSTEM_FORGED
+
         # Evidence-before-verify: ATTEST tuples must reference EVIDENCE
         if tuple_type == "ATTEST" and verification_id is None:
             logger.error(
@@ -623,8 +652,18 @@ class GovernanceBus:
                 )
                 return False, IDP_E_DECISION_AUTH
 
-        # PII scrub: sanitize tuple_data before it enters the hash-chained log.
-        scrubbed_data = _scrub_pii(tuple_data)
+        # PII detection (F8): the bus never rewrites tuple_data. Payloads
+        # containing likely PII are refused -- callers redact at the source
+        # before signing/hashing, or keep a separate redacted view.
+        pii_hits = _detect_pii(tuple_data)
+        if pii_hits:
+            logger.error(
+                "Governance entry rejected: likely PII in tuple_data %s. "
+                "Redact at the source before signing (F8); the bus does not "
+                "rewrite authenticated payloads.",
+                pii_hits,
+            )
+            return False, IDP_E_PII_DETECTED
 
         entry = GovernanceEntry(
             timestamp="",  # writer assigns at finalize (F3)
@@ -632,7 +671,7 @@ class GovernanceBus:
             intent_id=intent_id,
             task_id=task_id,
             tuple_type=tuple_type,
-            tuple_data=scrubbed_data,
+            tuple_data=tuple_data,
             state=state,
             drift=drift,
             contract_id=contract_id,
@@ -945,30 +984,100 @@ class GovernanceBus:
         ok, breaks = self._verify_entry_sequence(flat, anchors)
 
         # If the log starts above seq=1, require evidence the prefix was
-        # pruned (tombstone) or covered by an anchor beyond the gap.
+        # pruned. The excuse is *bound*, not merely present (non-author
+        # review 2026-09-25, findings R1-R3 / proposed G7-G9):
+        #   - the covering tombstone's pruned_head_hash must equal the
+        #     first retained entry's previous_hash (R2/G8);
+        #   - a tombstone claiming pruned_through_seq beyond the gap
+        #     contradicts the retained log -> fail;
+        #   - an anchor at the gap boundary must commit to the pruned
+        #     head hash, not merely carry a seq (R3/G9);
+        #   - when a boundary anchor exists it is authoritative: a
+        #     tombstone contradicting it fails (G7).
         if flat and flat[0][1] is not None:
             first_seq = flat[0][1].get("seq")
             if isinstance(first_seq, int) and first_seq > 1:
-                tombstone_ok = any(
-                    d is not None and d.get("tuple_type") == "SYSTEM"
+                gap_end = first_seq - 1
+                first_prev = flat[0][1].get("previous_hash")
+                first_loc = (flat[0][3], flat[0][1].get("entry_id"))
+
+                tombstones = [
+                    d["tuple_data"] for _r, d, _n, _l in flat
+                    if d is not None and d.get("tuple_type") == "SYSTEM"
                     and isinstance(d.get("tuple_data"), dict)
                     and d["tuple_data"].get("action") == "retention_prune"
-                    and int(d["tuple_data"].get("pruned_through_seq") or 0) >= first_seq - 1
-                    for _r, d, _n, _l in flat
+                ]
+                boundary_tombstone = next(
+                    (t for t in tombstones
+                     if int(t.get("pruned_through_seq") or 0) == gap_end),
+                    None,
                 )
-                anchor_ok = any(
-                    int(a["seq"]) >= first_seq - 1 for a in (anchors or [])
+                overclaim = any(
+                    int(t.get("pruned_through_seq") or 0) > gap_end
+                    for t in tombstones
                 )
-                if tombstone_ok or anchor_ok:
-                    first_loc = (flat[0][3], flat[0][1].get("entry_id"))
-                    breaks = [
-                        b for b in breaks
-                        if not (
-                            b["expected"].startswith("seq=1")
-                            or (b["expected"] == "null (genesis)"
-                                and (b["line"], b["entry_id"]) == first_loc)
-                        )
-                    ]
+                boundary_anchor = next(
+                    (a for a in (anchors or [])
+                     if int(a.get("seq", -1)) == gap_end),
+                    None,
+                )
+
+                excused = False
+                if overclaim:
+                    breaks.insert(0, {
+                        "line": flat[0][3],
+                        "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                        "segment": flat[0][2],
+                        "expected": f"tombstone pruned_through_seq <= {gap_end}",
+                        "actual": "tombstone claims to have pruned retained entries",
+                    })
+                elif boundary_anchor is not None:
+                    # The external anchor binds the boundary. Its hash must
+                    # equal the last pruned entry's hash (= first retained
+                    # previous_hash); a disagreeing tombstone also fails.
+                    tomb_ok = (
+                        boundary_tombstone is None
+                        or boundary_tombstone.get("pruned_head_hash") == first_prev
+                    )
+                    excused = (
+                        first_prev is not None
+                        and boundary_anchor.get("hash") == first_prev
+                        and tomb_ok
+                    )
+                    if not excused:
+                        breaks.insert(0, {
+                            "line": flat[0][3],
+                            "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                            "segment": flat[0][2],
+                            "expected": (
+                                f"anchor hash/tombstone hash == {first_prev}"
+                            ),
+                            "actual": (
+                                f"anchor hash "
+                                f"{boundary_anchor.get('hash')!r}, tombstone "
+                                f"{boundary_tombstone.get('pruned_head_hash') if boundary_tombstone else None!r}"
+                            ),
+                        })
+                elif boundary_tombstone is not None:
+                    # Agent-adversary scope only (R1 owner decision): with no
+                    # boundary anchor, the tombstone still must bind its
+                    # recorded head hash to the first retained previous_hash.
+                    excused = (
+                        first_prev is not None
+                        and boundary_tombstone.get("pruned_head_hash")
+                        == first_prev
+                    )
+                    if not excused:
+                        breaks.insert(0, {
+                            "line": flat[0][3],
+                            "entry_id": flat[0][1].get("entry_id", "UNKNOWN"),
+                            "segment": flat[0][2],
+                            "expected": f"pruned_head_hash == {first_prev}",
+                            "actual": (
+                                f"tombstone pruned_head_hash "
+                                f"{boundary_tombstone.get('pruned_head_hash')!r}"
+                            ),
+                        })
                 else:
                     breaks.insert(0, {
                         "line": flat[0][3],
@@ -977,6 +1086,16 @@ class GovernanceBus:
                         "expected": "tombstone or anchor covering pruned prefix",
                         "actual": f"log starts at seq={first_seq} with neither",
                     })
+
+                if excused:
+                    breaks = [
+                        b for b in breaks
+                        if not (
+                            b["expected"].startswith("seq=1")
+                            or (b["expected"] == "null (genesis)"
+                                and (b["line"], b["entry_id"]) == first_loc)
+                        )
+                    ]
 
         # Anchors beyond the log tail: a checkpointed entry that is missing
         # means tail truncation since the anchor was published (T2).
