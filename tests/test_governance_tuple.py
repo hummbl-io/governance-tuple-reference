@@ -360,7 +360,6 @@ class TestHashChain:
                 task_id=f"task-{i:03d}",
                 tuple_type="DCTX",
                 tuple_data={"task_id": f"task-{i:03d}", "status": "PROPOSED"},
-                signature=hashlib.sha256(f"sig-{i}".encode()).hexdigest(),
             )
             assert ok is True
             assert err is None
@@ -380,7 +379,6 @@ class TestHashChain:
             task_id="task-001",
             tuple_type="DCTX",
             tuple_data={"status": "PROPOSED"},
-            signature="sig-001",
         )
         bus.close()
 
@@ -422,7 +420,6 @@ class TestChainBreakDetection:
                 task_id=f"task-{i:03d}",
                 tuple_type="DCTX",
                 tuple_data={"index": i},
-                signature=hashlib.sha256(f"sig-{i}".encode()).hexdigest(),
             )
         bus.close()
 
@@ -456,7 +453,6 @@ class TestChainBreakDetection:
                 task_id=f"task-{i:03d}",
                 tuple_type="DCTX",
                 tuple_data={"index": i},
-                signature=hashlib.sha256(f"sig-{i}".encode()).hexdigest(),
             )
         bus.close()
 
@@ -834,18 +830,27 @@ class TestGovernanceBusEnforcement:
     """Test governance bus enforcement rules."""
 
     def test_signature_required(self, tmp_path):
-        """Append without signature should fail with IDP_E_AUDIT_IMMUTABLE."""
+        """Writer always tags entries; caller-supplied signatures rejected (F3/T3)."""
         bus = GovernanceBus(base_dir=tmp_path)
         ok, error = bus.append(
             intent_id="intent-001",
             task_id="task-001",
             tuple_type="DCTX",
             tuple_data={"status": "PROPOSED"},
-            signature=None,
+            signature="some-sig",
             require_signature=True,
         )
         assert ok is False
-        assert error == IDP_E_AUDIT_IMMUTABLE
+        from reference_impl.governance_bus import IDP_E_CALLER_SIGNATURE
+        assert error == IDP_E_CALLER_SIGNATURE
+        ok, error = bus.append(
+            intent_id="intent-001",
+            task_id="task-001",
+            tuple_type="DCTX",
+            tuple_data={"status": "PROPOSED"},
+        )
+        assert ok is True
+        assert error is None
 
     def test_attest_requires_verification_id(self, tmp_path):
         """ATTEST without verification_id should fail with IDP_E_EVIDENCE_REQUIRED."""
@@ -855,7 +860,6 @@ class TestGovernanceBusEnforcement:
             task_id="task-001",
             tuple_type="ATTEST",
             tuple_data={"result": "PASS"},
-            signature="some-sig",
         )
         assert ok is False
         assert error == IDP_E_EVIDENCE_REQUIRED

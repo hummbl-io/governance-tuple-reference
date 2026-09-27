@@ -359,7 +359,6 @@ class TestAppendErrorRecovery:
             task_id="t1",
             tuple_type="DCTX",
             tuple_data={"status": "PROPOSED"},
-            signature="sig",
             amendment_of="nonexistent-entry",
         )
         assert ok is False
@@ -376,7 +375,6 @@ class TestAppendErrorRecovery:
             task_id="t1",
             tuple_type="ATTEST",
             tuple_data={"result": "PASS"},
-            signature="sig",
         )
         assert ok is False
         assert err == IDP_E_EVIDENCE_REQUIRED
@@ -390,7 +388,7 @@ class TestAppendErrorRecovery:
         # First append a DCTX entry
         ok, _ = bus.append(
             intent_id="i1", task_id="t1", tuple_type="DCTX",
-            tuple_data={"status": "PROPOSED"}, signature="sig",
+            tuple_data={"status": "PROPOSED"},
         )
         assert ok is True
         # Try to ATTEST referencing the DCTX entry (not EVIDENCE)
@@ -398,7 +396,7 @@ class TestAppendErrorRecovery:
         dctx_entry = entries[0]
         ok, err = bus.append(
             intent_id="i1", task_id="t1", tuple_type="ATTEST",
-            tuple_data={"result": "PASS"}, signature="sig",
+            tuple_data={"result": "PASS"},
             verification_id=dctx_entry.entry_id,
         )
         assert ok is False
@@ -409,7 +407,7 @@ class TestAppendErrorRecovery:
         bus = GovernanceBus(base_dir=tmp_path)
         ok, err = bus.append(
             intent_id="i1", task_id="t1", tuple_type="DCTX",
-            tuple_data={"decision": "approve"}, signature="sig",
+            tuple_data={"decision": "approve"},
             authority_class=True,
         )
         assert ok is False
@@ -424,7 +422,7 @@ class TestAppendErrorRecovery:
         # Append a DCTX (not a DCT)
         ok, _ = bus.append(
             intent_id="i1", task_id="t1", tuple_type="DCTX",
-            tuple_data={"status": "PROPOSED"}, signature="sig",
+            tuple_data={"status": "PROPOSED"},
         )
         assert ok is True
         entries = list(bus.query_all())
@@ -432,7 +430,7 @@ class TestAppendErrorRecovery:
         # Try authority_class referencing the DCTX (not DCT)
         ok, err = bus.append(
             intent_id="i1", task_id="t1", tuple_type="DCTX",
-            tuple_data={"decision": "approve"}, signature="sig",
+            tuple_data={"decision": "approve"},
             authority_class=True,
             capability_token_id=dctx_entry.entry_id,
         )
