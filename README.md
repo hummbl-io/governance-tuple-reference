@@ -1,5 +1,8 @@
 # Governance Tuple Reference Implementation
 
+> **Canonical Monorepo Notice:** Production implementations of these governance tuple primitives are maintained in [`hummbl-io/oss`](https://github.com/hummbl-io/oss) under [`packages/python/hummbl-tuples`](https://github.com/hummbl-io/oss/tree/main/packages/python/hummbl-tuples) (`pip install hummbl-tuples`) and [`packages/python/hummbl-governance`](https://github.com/hummbl-io/oss/tree/main/packages/python/hummbl-governance) (`pip install hummbl-governance`).
+
+
 An anonymized, MIT-licensed, standalone reference implementation of the
 primitives described in the paper:
 
