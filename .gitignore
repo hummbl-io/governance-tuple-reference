@@ -12,3 +12,5 @@ build/
 
 # Shared lint config (symlinked, not committed)
 hummbl_lint_config
+
+bandit_out.json

@@ -1,0 +1,10 @@
+title = "governance-tuple-reference gitleaks config"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Synthetic UUIDv4 token_id / capability_token_id sample entries in sample_governance_log.jsonl"
+paths = [
+    '''^sample_governance_log\.jsonl$''',
+]
